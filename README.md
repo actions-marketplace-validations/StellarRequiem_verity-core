@@ -223,6 +223,162 @@ claim's `proof` — they're your own recipes, run in your own CI like your test 
 sandbox; never point it at an untrusted claims file. (For that reason `prove` is CLI/CI-only — it is
 deliberately **not** an MCP tool.) This repo gates its own `examples/proofs.jsonl` in CI.
 
+## Portable provenance — `verity attest`
+
+`prove` closes the loop for the *author*: a claim carries a re-runnable command and the
+gate runs it. That does not travel. `python3 examples/eval_demo.py` means nothing to
+someone who does not have the repository at the revision the number came from — and the
+harder problem underneath is that running a stranger's command is trusting a stranger's
+code. `prove` says so itself: it is not a sandbox.
+
+So the layer that travels is the one needing **no execution at all**:
+
+```sh
+verity attest examples/attestations.jsonl
+#   [CHECKABLE] demo-classifier accuracy reproduces from source
+#   VERIFIED — 1 attestation(s) checkable by an outsider, no credentials, nothing executed
+```
+
+An attestation pins what was claimed, which repository at which **immutable** commit
+produced it, and the command that would reproduce it — then commits to all of it with a
+content hash. Checking needs no network, no credentials and no interpreter.
+
+What makes fabrication expensive is what gets **refused**, not what gets warned about:
+
+| refused | why |
+|---|---|
+| `commit: main` | a claim pinned to a branch is pinned to nothing — it can move under the reader *after* they check it |
+| `repo: /Users/someone/project` | unreachable by anyone not on that machine |
+| `proof: python3 /Users/…/eval.py` | the command cannot run anywhere but where it was written |
+| an edited record | the digest no longer matches its contents |
+
+One warning earned the hard way: a proof invoking `python` rather than `python3` passes
+in CI, where `setup-python` provides both, and fails on a machine that has only
+`python3` — which is most of them. This repo's own example proof had exactly that bug
+and had it since June; the check exists because finding it took running the thing on a
+clean machine rather than reading it.
+
+**What this is not.** It is not a signature. An unkeyed digest proves the record is
+internally consistent, not that it came from who it says — anyone can mint an
+attestation naming any repository. What they cannot do is make the pinned commit contain
+a result it does not contain, so a fabrication survives exactly until one reader looks.
+For a public record that is the property that matters, and the output says so rather
+than implying more.
+
+## Many writers — `verity dag`
+
+`AuditChain` is a line: each entry names the one before it by hash and carries a `seq`,
+so integrity and *ordering* are the same guarantee. That is right for one writer, and
+its own docstring says to honour the single-writer rule. Two processes reading the same
+tip both produce `seq` N with the same `prev_hash`, and `verify()` correctly calls the
+result broken. The lock is not protecting the data — it is protecting the shape.
+
+No amount of care makes a line concurrent, so `MergeableChain` changes the shape. A node
+names every parent its writer actually saw, and the chain becomes a DAG. Each node still
+commits to its parents by hash, so no ancestor can be edited without breaking every
+descendant. What is given up is total order, which was never real. What is gained is
+that two agents writing at the same instant produce a **fork** — a legitimate recorded
+state rather than corruption.
+
+Measured, with the linear chain kept as the control in the same test file:
+
+| 8 processes × 25 writes | lines | `verify()` |
+|---|---|---|
+| `AuditChain` | 200 | **BROKEN** — seq mismatch at index 28 |
+| `MergeableChain` | 200 | **INTACT** — 200 nodes, nothing lost |
+
+```
+verity dag path/to/chain.jsonl --conflicts-on subject
+```
+
+Exit `0` only when integrity holds **and** nothing is contended. A fork on its own does
+not sink the exit code — concurrency is the point, and a gate that failed on it would be
+unusable by the thing it was built for. A *contended* claim does: two agents asserting
+different things about the same subject, neither having seen the other, is a state that
+needs a person.
+
+Three deliberate refusals:
+
+- **`append` never auto-merges.** It records the tips the writer actually read. Merging
+  on the next write would have one agent silently assert it had seen work it never saw,
+  and inventing causality is worse than an unmerged fork — the fork is visible.
+- **It does not decide what a conflict is.** A fork is concurrency, not disagreement.
+  Two agents recording unrelated findings at the same moment contend about nothing, so
+  `conflicts()` takes a key function from the caller rather than guessing the domain.
+- **It does not resolve one.** `conflicts()` returns pairs. A resolution that happens
+  automatically is a resolution nobody reviewed.
+
+The threat model is inherited from `AuditChain` unchanged: unkeyed is integrity, not
+tamper-evidence. `audit.py` is untouched by all of this — its on-disk format is
+byte-for-byte what it was, and existing chains keep verifying exactly as before.
+
+### Reading an existing linear chain as a DAG
+
+`verify_linear(rows)` reads records written by `AuditChain` under DAG rules, without
+converting or rewriting anything. It exists because of a real chain this refused:
+
+```
+AuditChain.verify()  →  BROKEN ✗ seq mismatch at index 463
+verify_linear(rows)  →  intact: 487 records, 1 concurrent write (widest 3-way),
+                                2 abandoned branch(es)
+```
+
+Same 487 bytes-on-disk records. Three of them shared `seq` 462 — and all three named
+the same `prev_hash`, every `entry_hash` recomputed, and a later record continued one
+of the branches. Three children of one parent. Nothing was damaged; the data simply
+never fitted the shape the verifier demanded.
+
+That distinction is the entire point. Reported as "BROKEN", the apparent remedy is to
+renumber `seq` until the walk passes — rewriting an append-only audit chain to satisfy
+a model it never matched, which is the one thing such a chain must never suffer. Read
+as a DAG, nothing needs repairing and nothing is written.
+
+Concurrency is surfaced rather than swallowed: the message names the fork points, the
+abandoned branches and the live head. Tampering, dangling parents and malformed
+records are still refused exactly as before.
+
+## Counting sources, not voices — `verity.quorum`
+
+One rule has lived in prose in every version of the protocol and been enforced by
+memory: *corroboration needs real, independent sources — not two instances of the same
+model in different hats.* Memory is the wrong place for it. Asking one model twice feels
+like agreement and costs almost nothing, and "two instances agreed" reads identically to
+"two sources agreed".
+
+```python
+from verity.quorum import Source, Signal, Kind, assess
+
+a = Source("claude-a", Kind.MODEL, model="claude-opus-5")
+b = Source("claude-b", Kind.MODEL, model="claude-opus-5")
+assess([Signal(a, True), Signal(b, True)]).state      # INSUFFICIENT — one source
+assess([Signal(a, True), Signal(tool, True)]).state   # CORROBORATED — two
+```
+
+Model instances collapse by model name; humans, tools and external parties each count
+in full, because two independent measurements genuinely are two measurements. Weights
+collapse the same way, or the fold would be cosmetic — three instances of one model
+shouting still weighs one source. Every collapse is named in `explain()`, so the number
+is auditable rather than taken on trust.
+
+**Cross-inhibition.** When scouts disagree, a colony does not merely advertise harder —
+it delivers stop signals that decrement a rival directly. Without that a swarm can
+deadlock between two good options forever, and for a colony indecision is the fatal
+outcome. An advisory `ALERT` nobody must act on *is* the deadlock, so a stop signal here
+can end a pursuit: past the halt threshold the state is `HALTED`, and further support
+does not revive it. Reviving takes an explicit, attributed `revive()` with a reason —
+a pursuit that quietly resumes was never stopped.
+
+The veto cannot be manufactured, either: weak stop signals from three instances of one
+model still weigh one source, which is the same asymmetry the independence rule exists
+to prevent.
+
+**The disanalogy, stated rather than papered over.** Bee cooperation is underwritten by
+shared genes — a worker has no separate interest, so a stop signal can be trusted.
+Agents have no such guarantee, and nothing prevents a source inhibiting a rival's claim
+*because* it is a rival. Verifiable provenance is the substitute and only a partial one:
+this weighs who is speaking and can be told a source is compromised, but it cannot
+detect a plausible liar.
+
 ## What it checks
 
 - **structural** — sample floors (too small = noise), suspicious **and impossible** accuracy
